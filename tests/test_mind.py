@@ -9,6 +9,7 @@ import pytest
 from kore_mind import Mind, Memory, Identity
 from kore_mind.models import MemoryType
 from kore_mind.decay import compute_decay
+from kore_mind.consolidate import text_similarity, merge_memories, consolidate
 
 
 @pytest.fixture
@@ -20,6 +21,9 @@ def mind():
     yield m
     m.close()
     os.unlink(path)
+
+
+# ── Experience ─────────────────────────────────────────────────────────
 
 
 class TestExperience:
@@ -48,6 +52,9 @@ class TestExperience:
         assert mind.count == 3
 
 
+# ── Recall ─────────────────────────────────────────────────────────────
+
+
 class TestRecall:
     def test_recall_all(self, mind):
         mind.experience("Python is great")
@@ -60,7 +67,7 @@ class TestRecall:
         mind.experience("User likes coffee")
         memories = mind.recall("NP")
         assert len(memories) == 2
-        assert "NP" in memories[0].content  # más relevante primero
+        assert "NP" in memories[0].content
 
     def test_recall_reinforces(self, mind):
         mem = mind.experience("Important fact")
@@ -76,18 +83,20 @@ class TestRecall:
         assert len(memories) == 1
 
 
+# ── Decay ──────────────────────────────────────────────────────────────
+
+
 class TestDecay:
     def test_decay_reduces_salience(self):
         mem = Memory(content="Old memory", salience=1.0)
-        # Simular que pasó mucho tiempo
-        future = time.time() + 30 * 24 * 3600  # 30 días
+        future = time.time() + 30 * 24 * 3600
         decayed = compute_decay(mem, now=future)
         assert decayed < mem.salience
 
     def test_accessed_memories_decay_slower(self):
         mem_unused = Memory(content="Unused", salience=1.0)
         mem_used = Memory(content="Used", salience=1.0, access_count=10)
-        future = time.time() + 14 * 24 * 3600  # 14 días
+        future = time.time() + 14 * 24 * 3600
         decay_unused = compute_decay(mem_unused, now=future)
         decay_used = compute_decay(mem_used, now=future)
         assert decay_used > decay_unused
@@ -96,6 +105,55 @@ class TestDecay:
         mem = Memory(content="Fresh", salience=0.8)
         decayed = compute_decay(mem, now=mem.last_accessed)
         assert decayed == 0.8
+
+
+# ── Consolidation ──────────────────────────────────────────────────────
+
+
+class TestConsolidation:
+    def test_text_similarity(self):
+        assert text_similarity("user likes python", "user likes python") == 1.0
+        assert text_similarity("user likes python", "user likes java") > 0.5
+        assert text_similarity("hello", "completely different") < 0.3
+
+    def test_merge_memories(self):
+        a = Memory(content="User likes Python", salience=0.8,
+                   access_count=5, tags=["python"])
+        b = Memory(content="User likes Python programming", salience=0.6,
+                   access_count=3, tags=["programming"])
+        merged = merge_memories(a, b)
+        assert merged.salience == min(1.0, 0.8 + 0.1)  # consolidation bonus
+        assert merged.access_count == 8
+        assert "python" in merged.tags
+        assert "programming" in merged.tags
+
+    def test_consolidate_similar(self):
+        mems = [
+            Memory(content="User prefers Python for data science", tags=["python"]),
+            Memory(content="User prefers Python for data analysis", tags=["python"]),
+            Memory(content="User likes coffee in the morning", tags=["coffee"]),
+        ]
+        consolidated, deleted = consolidate(mems, threshold=0.6)
+        # The two Python memories should merge
+        assert len(deleted) == 1
+        assert len(consolidated) == 2
+
+    def test_consolidate_nothing_similar(self):
+        mems = [
+            Memory(content="Python is great"),
+            Memory(content="The weather is sunny"),
+        ]
+        consolidated, deleted = consolidate(mems, threshold=0.7)
+        assert len(deleted) == 0
+        assert len(consolidated) == 2
+
+    def test_consolidate_empty(self):
+        consolidated, deleted = consolidate([], threshold=0.7)
+        assert consolidated == []
+        assert deleted == []
+
+
+# ── Reflect ────────────────────────────────────────────────────────────
 
 
 class TestReflect:
@@ -116,12 +174,61 @@ class TestReflect:
         assert "Custom:" in identity.summary
 
     def test_reflect_cleans_dead_memories(self, mind):
-        # Crear recuerdo con salience ya muy baja
         mem = mind.experience("Dying memory", salience=0.005)
         assert mind.count == 1
         mind.reflect()
-        # Con salience 0.005 y death_threshold 0.01, debería morir
         assert mind.count == 0
+
+    def test_reflect_consolidates(self, mind):
+        mind.experience("User works with Python daily")
+        mind.experience("User works with Python every day")
+        mind.experience("User enjoys hiking on weekends")
+        assert mind.count == 3
+        mind.reflect()
+        # The two Python memories should consolidate
+        assert mind.count == 2
+
+
+# ── Embeddings ─────────────────────────────────────────────────────────
+
+
+class TestEmbeddings:
+    @pytest.fixture
+    def mind_with_embeddings(self):
+        """Mind with a simple hash-based pseudo-embedder for testing."""
+        import hashlib
+        import struct
+
+        def simple_embed(text: str) -> bytes:
+            """Deterministic pseudo-embedding for testing. NOT semantic."""
+            h = hashlib.sha256(text.encode()).digest()
+            # Convert to 8 float32 values
+            values = struct.unpack('8f', h)
+            return struct.pack(f'{len(values)}f', *values)
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        m = Mind(path, embed_fn=simple_embed)
+        yield m
+        m.close()
+        os.unlink(path)
+
+    def test_experience_creates_embedding(self, mind_with_embeddings):
+        mem = mind_with_embeddings.experience("Test content")
+        assert mem.embedding is not None
+        assert len(mem.embedding) > 0
+
+    def test_embedding_persists(self, mind_with_embeddings):
+        mind_with_embeddings.experience("Persistent embedding test")
+        memories = mind_with_embeddings.recall()
+        assert memories[0].embedding is not None
+
+    def test_no_embedding_without_fn(self, mind):
+        mem = mind.experience("No embedding")
+        assert mem.embedding is None
+
+
+# ── Forget ─────────────────────────────────────────────────────────────
 
 
 class TestForget:
@@ -138,6 +245,9 @@ class TestForget:
         assert forgotten == 0
 
 
+# ── Identity ───────────────────────────────────────────────────────────
+
+
 class TestIdentity:
     def test_identity_empty(self, mind):
         identity = mind.identity()
@@ -148,7 +258,10 @@ class TestIdentity:
         mind.reflect()
         identity = mind.identity()
         assert identity.summary != ""
-        assert identity.traits  # algo debería haber emergido
+        assert identity.traits
+
+
+# ── Context Manager ────────────────────────────────────────────────────
 
 
 class TestContextManager:

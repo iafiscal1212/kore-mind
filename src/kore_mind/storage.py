@@ -29,7 +29,8 @@ class Storage:
                 last_accessed REAL NOT NULL,
                 access_count INTEGER NOT NULL DEFAULT 0,
                 source TEXT NOT NULL DEFAULT '',
-                tags TEXT NOT NULL DEFAULT '[]'
+                tags TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB
             );
 
             CREATE TABLE IF NOT EXISTS identity (
@@ -45,18 +46,23 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_memories_created
                 ON memories(created_at DESC);
         """)
+        # Migration: add embedding column if upgrading from v0.1.0
+        try:
+            self.conn.execute("SELECT embedding FROM memories LIMIT 0")
+        except sqlite3.OperationalError:
+            self.conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
         self.conn.commit()
 
     def save_memory(self, mem: Memory) -> None:
         self.conn.execute(
             """INSERT OR REPLACE INTO memories
                (id, content, type, salience, created_at, last_accessed,
-                access_count, source, tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                access_count, source, tags, embedding)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem.id, mem.content, mem.type.value, mem.salience,
                 mem.created_at, mem.last_accessed, mem.access_count,
-                mem.source, json.dumps(mem.tags),
+                mem.source, json.dumps(mem.tags), mem.embedding,
             ),
         )
         self.conn.commit()
@@ -151,4 +157,5 @@ class Storage:
             access_count=row[6],
             source=row[7],
             tags=json.loads(row[8]),
+            embedding=row[9] if len(row) > 9 else None,
         )

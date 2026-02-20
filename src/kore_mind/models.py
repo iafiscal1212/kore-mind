@@ -26,6 +26,7 @@ class Memory:
     access_count: int = 0
     source: str = ""            # quién/qué generó este recuerdo
     tags: list[str] = field(default_factory=list)
+    embedding: bytes | None = None  # optional embedding vector (numpy .tobytes())
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     def access(self) -> None:

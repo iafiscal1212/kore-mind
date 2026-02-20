@@ -6,9 +6,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from kore_mind.consolidate import consolidate
 from kore_mind.decay import DEFAULT_HALF_LIFE, apply_decay
 from kore_mind.models import Identity, Memory, MemoryType
 from kore_mind.storage import Storage
+
+# Type: takes text, returns embedding as bytes (numpy float32 .tobytes())
+EmbedFn = Callable[[str], bytes]
 
 
 class Mind:
@@ -23,9 +27,11 @@ class Mind:
     """
 
     def __init__(self, path: str | Path = "mind.db",
-                 half_life: float = DEFAULT_HALF_LIFE) -> None:
+                 half_life: float = DEFAULT_HALF_LIFE,
+                 embed_fn: EmbedFn | None = None) -> None:
         self._storage = Storage(path)
         self._half_life = half_life
+        self._embed_fn = embed_fn
 
     # ── experience ─────────────────────────────────────────────────────
 
@@ -38,12 +44,17 @@ class Mind:
         if isinstance(type, str):
             type = MemoryType(type)
 
+        embedding = None
+        if self._embed_fn is not None:
+            embedding = self._embed_fn(content)
+
         mem = Memory(
             content=content,
             type=type,
             source=source,
             tags=tags or [],
             salience=salience,
+            embedding=embedding,
         )
         self._storage.save_memory(mem)
         return mem
@@ -55,45 +66,60 @@ class Mind:
         """Recupera recuerdos relevantes.
 
         Sin query: devuelve los más salientes.
-        Con query: busca por contenido (substring match simple).
-
-        Para búsqueda semántica con embeddings, usa kore-bridge.
+        Con query + embed_fn: búsqueda semántica por cosine similarity.
+        Con query sin embed_fn: búsqueda por substring match.
         """
         memories = self._storage.top_memories(
-            limit=limit * 3,  # fetch extra, filter down
+            limit=limit * 3,
             min_salience=min_salience,
         )
 
-        if query:
+        if query and self._embed_fn is not None:
+            # Semantic search
+            query_emb = self._embed_fn(query)
+            from kore_mind.embeddings import semantic_search
+            scored = semantic_search(query_emb, memories, limit=limit)
+            # Combine semantic score with salience
+            result = []
+            for sim, mem in scored:
+                combined = sim * 0.7 + mem.salience * 0.3
+                result.append((combined, mem))
+            result.sort(key=lambda x: x[0], reverse=True)
+            result = [mem for _, mem in result[:limit]]
+        elif query:
+            # Text search fallback — only reinforce actual matches
             query_lower = query.lower()
             scored = []
             for mem in memories:
-                # Score simple: substring match + tag match + salience
-                score = mem.salience
+                relevance = 0.0
                 content_lower = mem.content.lower()
                 if query_lower in content_lower:
-                    score += 1.0
+                    relevance += 1.0
                 for tag in mem.tags:
                     if query_lower in tag.lower():
-                        score += 0.5
-                scored.append((score, mem))
+                        relevance += 0.5
+                score = mem.salience + relevance
+                scored.append((score, relevance, mem))
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            result = [mem for _, mem in scored[:limit]]
+            result = [(rel, mem) for _, rel, mem in scored[:limit]]
         else:
-            result = memories[:limit]
+            result = [(1.0, mem) for mem in memories[:limit]]
 
-        # Acceder refuerza
-        for mem in result:
-            mem.access()
-            self._storage.save_memory(mem)
+        # Acceder refuerza — only if the memory actually matched
+        final = []
+        for relevance, mem in result:
+            if relevance > 0:
+                mem.access()
+                self._storage.save_memory(mem)
+            final.append(mem)
 
-        return result
+        return final
 
     # ── reflect ────────────────────────────────────────────────────────
 
     def reflect(self, summarizer: Callable[[list[Memory]], Identity] | None = None) -> Identity:
-        """Consolida la mente: decay + poda + identidad emergente.
+        """Consolida la mente: decay + consolidación + poda + identidad emergente.
 
         Args:
             summarizer: función opcional que recibe recuerdos y genera Identity.
@@ -109,11 +135,19 @@ class Mind:
         for mem in dead:
             self._storage.delete_memory(mem.id)
 
-        # 3. Guardar decayed salience
+        # 3. Consolidación: fusionar recuerdos similares
+        use_emb = self._embed_fn is not None
+        alive, deleted_ids = consolidate(
+            alive, threshold=0.7, use_embeddings=use_emb,
+        )
+        for did in deleted_ids:
+            self._storage.delete_memory(did)
+
+        # 4. Guardar estado actualizado
         for mem in alive:
             self._storage.save_memory(mem)
 
-        # 4. Generar identidad
+        # 5. Generar identidad
         if summarizer is not None:
             identity = summarizer(alive)
         else:
@@ -162,7 +196,6 @@ class Mind:
         if not memories:
             return Identity(summary="No memories yet.")
 
-        # Contar tipos
         type_counts: dict[str, int] = {}
         sources: dict[str, int] = {}
         all_tags: dict[str, int] = {}
@@ -174,11 +207,9 @@ class Mind:
             for tag in mem.tags:
                 all_tags[tag] = all_tags.get(tag, 0) + 1
 
-        # Top tags como traits
         sorted_tags = sorted(all_tags.items(), key=lambda x: x[1], reverse=True)
         traits = {tag: count / len(memories) for tag, count in sorted_tags[:10]}
 
-        # Summary
         top_tags = [t[0] for t in sorted_tags[:5]]
         dominant_type = max(type_counts, key=type_counts.get)
         summary = (
@@ -186,7 +217,6 @@ class Mind:
             f"Focus: {', '.join(top_tags) if top_tags else 'general'}."
         )
 
-        # Relationships from sources
         relationships = {src: f"{count} interactions" for src, count in sources.items()}
 
         return Identity(
