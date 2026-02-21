@@ -90,6 +90,14 @@ class Storage:
                 ON query_log(query_hash, source);
             CREATE INDEX IF NOT EXISTS idx_query_log_created
                 ON query_log(created_at);
+
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+                text_hash TEXT NOT NULL,
+                model TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (text_hash, model)
+            );
         """)
         # Migration: add embedding column if upgrading from v0.1.0
         try:
@@ -317,6 +325,26 @@ class Storage:
         )
         self.conn.commit()
         return cursor.rowcount
+
+    # ── Embedding Cache ───────────────────────────────────────────────
+
+    def save_embedding_cache(self, text_hash: str, model: str,
+                             embedding: bytes) -> None:
+        self.conn.execute(
+            """INSERT OR REPLACE INTO embedding_cache
+               (text_hash, model, embedding, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (text_hash, model, embedding, time.time()),
+        )
+        self.conn.commit()
+
+    def load_embedding_cache(self, text_hash: str,
+                             model: str) -> bytes | None:
+        row = self.conn.execute(
+            "SELECT embedding FROM embedding_cache WHERE text_hash = ? AND model = ?",
+            (text_hash, model),
+        ).fetchone()
+        return row[0] if row else None
 
     # ── Close ──────────────────────────────────────────────────────────
 

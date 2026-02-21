@@ -2,10 +2,10 @@
 
 from kore_mind.models import Memory, Identity, MemoryType, Trace, CacheEntry
 from kore_mind.mind import Mind
-from kore_mind.embeddings import numpy_embed, ollama_embed, openai_embed
+from kore_mind.embeddings import numpy_embed, ollama_embed, ollama_embed_async, openai_embed
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "Mind", "Memory", "Identity", "MemoryType", "Trace", "CacheEntry",
-    "numpy_embed", "ollama_embed", "openai_embed",
+    "numpy_embed", "ollama_embed", "ollama_embed_async", "openai_embed",
 ]

@@ -1,5 +1,6 @@
-"""Tests for built-in embedding providers (v0.3.1)."""
+"""Tests for built-in embedding providers (v0.4.0)."""
 
+import asyncio
 import json
 import os
 import tempfile
@@ -13,7 +14,9 @@ from kore_mind.embeddings import (
     cosine_similarity,
     numpy_embed,
     ollama_embed,
+    ollama_embed_async,
 )
+from kore_mind.storage import Storage
 from kore_mind import Mind
 
 
@@ -85,7 +88,7 @@ def test_ollama_embed_fallback():
 
 
 def test_mind_with_numpy_embed():
-    """Full flow: experience → semantic recall with numpy_embed."""
+    """Full flow: experience -> semantic recall with numpy_embed."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -134,7 +137,7 @@ def test_consolidation_with_numpy_embed():
 
         # With embeddings, similar memories should consolidate
         assert after <= before, (
-            f"Consolidation should reduce or maintain count: {before} → {after}"
+            f"Consolidation should reduce or maintain count: {before} -> {after}"
         )
     finally:
         mind.close()
@@ -155,7 +158,7 @@ def _fake_ollama_response(texts):
 
 
 def test_ollama_cache_hit():
-    """Second call with same text returns cached result — no HTTP."""
+    """Second call with same text returns cached result -- no HTTP."""
     import http.client
     embed = ollama_embed()
 
@@ -280,3 +283,346 @@ def test_ollama_connection_reuse():
     assert connections_created[0] == 1, (
         f"Expected 1 connection, got {connections_created[0]}"
     )
+
+
+# ── v0.4.0: Mejora 1 — Cache persistente L2 (SQLite) ────────────────────
+
+
+def test_persistent_cache_save_load():
+    """Guardar en SQLite, reiniciar, recuperar embedding."""
+    import http.client
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        store = Storage(db_path)
+
+        # Create embed with storage
+        embed = ollama_embed(storage=store)
+
+        def mock_request(self, method, url, body=None, headers={}):
+            req_body = json.loads(body)
+            self._fake_body = _fake_ollama_response(req_body["input"])
+
+        def mock_getresponse(self):
+            resp = mock.Mock()
+            resp.read.return_value = self._fake_body
+            resp.status = 200
+            return resp
+
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                first_result = embed("persistent text")
+
+        store.close()
+
+        # "Restart" — new Storage, new embed (fresh L1)
+        store2 = Storage(db_path)
+        embed2 = ollama_embed(storage=store2)
+
+        call_count = [0]
+
+        def mock_request2(self, method, url, body=None, headers={}):
+            call_count[0] += 1
+            req_body = json.loads(body)
+            self._fake_body = _fake_ollama_response(req_body["input"])
+
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request2):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                second_result = embed2("persistent text")
+
+        assert first_result == second_result
+        assert call_count[0] == 0, "Should hit L2 cache, no HTTP"
+        store2.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_persistent_cache_l1_l2_flow():
+    """L1 miss -> L2 hit -> no HTTP."""
+    import http.client
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        store = Storage(db_path)
+
+        # Manually insert into L2
+        test_vec = np.random.default_rng(42).random(768).astype(np.float32).tobytes()
+        from kore_mind.embeddings import _text_hash
+        store.save_embedding_cache(
+            _text_hash("l2 cached text"), "nomic-embed-text", test_vec
+        )
+
+        # Create embed with storage — L1 is empty
+        embed = ollama_embed(storage=store)
+        call_count = [0]
+
+        def mock_request(self, method, url, body=None, headers={}):
+            call_count[0] += 1
+
+        def mock_getresponse(self):
+            resp = mock.Mock()
+            resp.read.return_value = b'{}'
+            return resp
+
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                result = embed("l2 cached text")
+
+        assert result == test_vec
+        assert call_count[0] == 0, "L2 hit should bypass HTTP"
+        store.close()
+    finally:
+        os.unlink(db_path)
+
+
+# ── v0.4.0: Mejora 2 — Validación dimensional ───────────────────────────
+
+
+def test_dimension_mismatch_raises():
+    """cosine_similarity(256d, 768d) -> ValueError."""
+    a = np.zeros(256, dtype=np.float32).tobytes()
+    b = np.zeros(768, dtype=np.float32).tobytes()
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        cosine_similarity(a, b)
+
+
+def test_dimension_match_works():
+    """cosine_similarity(768d, 768d) -> normal float."""
+    rng = np.random.default_rng(42)
+    a = rng.random(768).astype(np.float32).tobytes()
+    b = rng.random(768).astype(np.float32).tobytes()
+    sim = cosine_similarity(a, b)
+    assert isinstance(sim, float)
+    assert -1.0 <= sim <= 1.0 + 1e-6
+
+
+# ── v0.4.0: Mejora 4 — Cuantización float16 ─────────────────────────────
+
+
+def test_quantize_halves_size():
+    """quantize=True -> bytes = dims*2 en vez de dims*4."""
+    import http.client
+    embed = ollama_embed(quantize=True)
+
+    def mock_request(self, method, url, body=None, headers={}):
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            result = embed("quantize test")
+
+    # float16: 768 dims * 2 bytes = 1536
+    assert len(result) == 768 * 2, f"Expected {768*2}, got {len(result)}"
+
+
+def test_quantize_cosine_accuracy():
+    """cosine(float32, float16) ~= cosine(float32, float32) +/- 0.01."""
+    rng = np.random.default_rng(123)
+    vec_a = rng.random(768).astype(np.float32)
+    vec_b = rng.random(768).astype(np.float32)
+
+    a_f32 = vec_a.tobytes()
+    b_f32 = vec_b.tobytes()
+    b_f16 = vec_b.astype(np.float16).tobytes()
+
+    sim_exact = cosine_similarity(a_f32, b_f32)
+    sim_mixed = cosine_similarity(a_f32, b_f16)
+
+    assert abs(sim_exact - sim_mixed) < 0.01, (
+        f"Float16 should be accurate within 0.01: exact={sim_exact:.6f}, mixed={sim_mixed:.6f}"
+    )
+
+
+# ── v0.4.0: Mejora 5 — Async variant ────────────────────────────────────
+
+
+def test_async_embed():
+    """await embed('text') devuelve bytes."""
+    import http.client
+
+    def mock_request(self, method, url, body=None, headers={}):
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    embed = ollama_embed_async()
+
+    async def _run():
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                return await embed("async test")
+
+    result = asyncio.run(_run())
+    assert isinstance(result, bytes)
+    assert len(result) == 768 * 4
+
+
+def test_async_batch():
+    """await embed.batch(texts) devuelve lista correcta."""
+    import http.client
+
+    def mock_request(self, method, url, body=None, headers={}):
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    embed = ollama_embed_async()
+
+    async def _run():
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                return await embed.batch(["alpha", "beta", "gamma"])
+
+    results = asyncio.run(_run())
+    assert isinstance(results, list)
+    assert len(results) == 3
+    for r in results:
+        assert isinstance(r, bytes)
+        assert len(r) == 768 * 4
+
+
+# ── v0.4.0: Mejora 6 — Streaming batch ──────────────────────────────────
+
+
+def test_stream_batch_yields_chunks():
+    """stream_batch(20 texts, chunk_size=8) yield 3 chunks."""
+    import http.client
+    embed = ollama_embed()
+    texts = [f"text_{i}" for i in range(20)]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            chunks = list(embed.stream_batch(texts, chunk_size=8))
+
+    assert len(chunks) == 3  # ceil(20/8) = 3
+    assert len(chunks[0]) == 8
+    assert len(chunks[1]) == 8
+    assert len(chunks[2]) == 4
+
+
+def test_stream_batch_correct_order():
+    """Resultados en el mismo orden que input."""
+    import http.client
+    embed = ollama_embed()
+    texts = [f"ordered_{i}" for i in range(12)]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    # Also get full batch for comparison
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            full = embed.batch(texts)
+            # Reset cache to re-embed via stream
+            embed2 = ollama_embed()
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            streamed = []
+            for chunk in embed2.stream_batch(texts, chunk_size=4):
+                streamed.extend(chunk)
+
+    assert len(streamed) == len(full)
+    for i in range(len(full)):
+        assert streamed[i] == full[i], f"Mismatch at index {i}"
+
+
+def test_astream_batch_concurrent():
+    """Async generator produce chunks ordenados."""
+    import http.client
+    embed = ollama_embed()
+    texts = [f"async_{i}" for i in range(16)]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    async def _run():
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                results = []
+                async for chunk in embed.astream_batch(texts, chunk_size=4, concurrency=2):
+                    results.append(chunk)
+                return results
+
+    chunks = asyncio.run(_run())
+    assert len(chunks) == 4  # 16/4 = 4 chunks
+    for chunk in chunks:
+        assert len(chunk) == 4
+        for item in chunk:
+            assert isinstance(item, bytes)
+            assert len(item) == 768 * 4
+
+
+def test_stream_batch_uses_cache():
+    """Textos cacheados no generan HTTP en streaming."""
+    import http.client
+    embed = ollama_embed()
+    call_count = [0]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        req_body = json.loads(body)
+        self._fake_body = _fake_ollama_response(req_body["input"])
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            # Pre-cache some texts
+            embed("cached_0")
+            embed("cached_1")
+            call_count[0] = 0
+
+            # Stream with mix of cached and uncached
+            texts = ["cached_0", "new_0", "cached_1", "new_1"]
+            chunks = list(embed.stream_batch(texts, chunk_size=4))
+
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 4
+    # Only 2 uncached texts should trigger HTTP (1 call because they're in the same chunk)
+    assert call_count[0] == 1, f"Expected 1 HTTP call for uncached, got {call_count[0]}"
