@@ -85,6 +85,22 @@ mind = Mind("agent.db", embed_fn=ollama_embed())
 mind = Mind("agent.db", embed_fn=openai_embed(api_key="sk-..."))
 ```
 
+### Ollama optimizations (v0.3.1)
+
+`ollama_embed()` now includes connection reuse, LRU cache, batch embedding, and fallback warnings:
+
+```python
+embed = ollama_embed(model="nomic-embed-text", cache_size=512)
+
+# Single embeddings — cached automatically (same text = 0 HTTP calls)
+vec = embed("some text")
+
+# Batch embedding — one HTTP call for all uncached texts
+vectors = embed.batch(["text one", "text two", "text three"])
+
+# Fallback to numpy emits RuntimeWarning (dimension mismatch: 256d vs 768d)
+```
+
 ## v0.2 Features
 
 ### Per-user filtering

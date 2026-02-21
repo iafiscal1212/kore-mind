@@ -1,6 +1,6 @@
 """Optional embeddings support. Cosine similarity for semantic recall.
 
-Built-in providers (v0.3):
+Built-in providers (v0.3.1):
     numpy_embed(dims)   — zero-dependency hashing vectorizer
     ollama_embed(model)  — local Ollama server, falls back to numpy
     openai_embed(api_key) — OpenAI API embeddings
@@ -8,11 +8,15 @@ Built-in providers (v0.3):
 
 from __future__ import annotations
 
+import collections
 import hashlib
+import http.client
 import json
 import struct
 import urllib.error
+import urllib.parse
 import urllib.request
+import warnings
 from typing import Callable
 
 from kore_mind.models import Memory
@@ -52,32 +56,119 @@ def numpy_embed(dims: int = 256) -> EmbedFn:
 def ollama_embed(
     model: str = "nomic-embed-text",
     base_url: str = "http://localhost:11434",
+    cache_size: int = 512,
 ) -> EmbedFn:
     """Ollama embedding provider. Falls back to numpy_embed if Ollama is unavailable.
 
-    Uses POST /api/embed (stdlib urllib only — zero new dependencies).
+    v0.3.1 improvements:
+    - Connection reuse via http.client.HTTPConnection (keep-alive)
+    - LRU cache (OrderedDict, configurable size)
+    - Batch embedding via .batch(texts) — single HTTP call
+    - RuntimeWarning on fallback (dimension mismatch: numpy=256d, Ollama=768d)
     """
     import numpy as np
 
+    parsed = urllib.parse.urlparse(base_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 11434
+
     fallback = numpy_embed()
+    cache: collections.OrderedDict[str, bytes] = collections.OrderedDict()
+    conn_holder: list[http.client.HTTPConnection | None] = [None]
+    warned_fallback = [False]
+
+    def _get_conn() -> http.client.HTTPConnection:
+        """Return existing connection or create a new one."""
+        if conn_holder[0] is None:
+            conn_holder[0] = http.client.HTTPConnection(host, port, timeout=10)
+        return conn_holder[0]
+
+    def _post(payload: bytes) -> dict:
+        """POST to /api/embed with 1 automatic retry on broken connection."""
+        for attempt in range(2):
+            try:
+                conn = _get_conn()
+                conn.request(
+                    "POST", "/api/embed", body=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                return json.loads(resp.read())
+            except (http.client.HTTPException, OSError):
+                conn_holder[0] = None  # force reconnect
+                if attempt == 1:
+                    raise
+        raise OSError("unreachable")
+
+    def _cache_put(text: str, value: bytes) -> None:
+        cache[text] = value
+        cache.move_to_end(text)
+        while len(cache) > cache_size:
+            cache.popitem(last=False)
+
+    def _fallback_with_warning(text: str) -> bytes:
+        if not warned_fallback[0]:
+            warnings.warn(
+                "Ollama unavailable — falling back to numpy_embed. "
+                "Warning: numpy vectors (256d) are incompatible with "
+                "Ollama vectors (768d). Do not mix them.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            warned_fallback[0] = True
+        return fallback(text)
 
     def _embed(text: str) -> bytes:
+        # Cache hit
+        if text in cache:
+            cache.move_to_end(text)
+            return cache[text]
+        # Cache miss — call Ollama
         try:
             payload = json.dumps({"model": model, "input": text}).encode()
-            req = urllib.request.Request(
-                f"{base_url}/api/embed",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
+            data = _post(payload)
             embedding = data["embeddings"][0]
             vec = np.array(embedding, dtype=np.float32)
-            return vec.tobytes()
-        except (urllib.error.URLError, OSError, KeyError, IndexError):
-            return fallback(text)
+            result = vec.tobytes()
+            _cache_put(text, result)
+            return result
+        except (http.client.HTTPException, OSError, KeyError, IndexError):
+            result = _fallback_with_warning(text)
+            _cache_put(text, result)
+            return result
 
+    def _batch(texts: list[str]) -> list[bytes]:
+        """Embed multiple texts in a single HTTP call. Uses cache for known texts."""
+        results: list[bytes | None] = [None] * len(texts)
+        to_fetch: list[tuple[int, str]] = []
+
+        for i, text in enumerate(texts):
+            if text in cache:
+                cache.move_to_end(text)
+                results[i] = cache[text]
+            else:
+                to_fetch.append((i, text))
+
+        if to_fetch:
+            fetch_texts = [t for _, t in to_fetch]
+            try:
+                payload = json.dumps({"model": model, "input": fetch_texts}).encode()
+                data = _post(payload)
+                embeddings = data["embeddings"]
+                for j, (idx, text) in enumerate(to_fetch):
+                    vec = np.array(embeddings[j], dtype=np.float32)
+                    result = vec.tobytes()
+                    _cache_put(text, result)
+                    results[idx] = result
+            except (http.client.HTTPException, OSError, KeyError, IndexError):
+                for idx, text in to_fetch:
+                    result = _fallback_with_warning(text)
+                    _cache_put(text, result)
+                    results[idx] = result
+
+        return results  # type: ignore[return-value]
+
+    _embed.batch = _batch  # type: ignore[attr-defined]
     return _embed
 
 
