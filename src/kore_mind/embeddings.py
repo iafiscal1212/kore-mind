@@ -1,18 +1,15 @@
 """Optional embeddings support. Cosine similarity for semantic recall.
 
-Built-in providers (v0.4.0):
+Built-in providers (v0.5.0):
     numpy_embed(dims)        — zero-dependency hashing vectorizer
     ollama_embed(model)      — local Ollama server, falls back to numpy
-    ollama_embed_async()     — async wrapper around ollama_embed
+    ollama_embed_async()     — native async variant of ollama_embed
     openai_embed(api_key)    — OpenAI API embeddings
 
-v0.4.0 improvements:
-    1. Persistent L2 cache in SQLite (via Storage)
-    2. Dimension validation in cosine_similarity
-    3. Cache key includes model (SQLite PK = text_hash + model)
-    4. Float16 quantization option (half memory usage)
-    5. Async variant (ollama_embed_async)
-    6. Streaming batch (stream_batch / astream_batch)
+v0.5.0 improvements:
+    1. Retry with exponential backoff + jitter (sync and async)
+    2. Native async HTTP via asyncio.open_connection (no thread pool)
+    3. Retryable HTTP errors: 5xx, 429, OSError, HTTPException
 """
 
 from __future__ import annotations
@@ -39,6 +36,15 @@ EmbedFn = Callable[[str], bytes]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
+
+class _RetryableHTTPError(Exception):
+    """HTTP status that should trigger a retry (5xx, 429)."""
+
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}")
 
 
 def _text_hash(text: str) -> str:
@@ -96,14 +102,19 @@ def ollama_embed(
     cache_size: int = 512,
     storage: Storage | None = None,
     quantize: bool = False,
+    max_retries: int = 3,
+    retry_base_delay: float = 0.5,
+    retry_max_delay: float = 10.0,
 ) -> EmbedFn:
     """Ollama embedding provider. Falls back to numpy_embed if Ollama is unavailable.
 
-    v0.4.0 improvements:
+    v0.5.0 improvements:
+    - Retry with exponential backoff + jitter on 5xx/429/OSError
+    - Native async HTTP via asyncio.open_connection (async_call, async_batch)
     - L1 in-memory LRU cache + L2 persistent SQLite cache (via storage)
     - Float16 quantization (quantize=True halves embedding size)
     - stream_batch() / astream_batch() for incremental processing
-    - Connection reuse via http.client.HTTPConnection (keep-alive)
+    - Connection reuse via http.client.HTTPConnection (keep-alive, sync)
     - Batch embedding via .batch(texts) -- single HTTP call
     - RuntimeWarning on fallback (dimension mismatch: numpy=256d, Ollama=768d)
     """
@@ -125,8 +136,12 @@ def ollama_embed(
         return conn_holder[0]
 
     def _post(payload: bytes) -> dict:
-        """POST to /api/embed with 1 automatic retry on broken connection."""
-        for attempt in range(2):
+        """POST to /api/embed with exponential backoff retry."""
+        import random
+        import time
+
+        last_exc = None
+        for attempt in range(max_retries + 1):
             try:
                 conn = _get_conn()
                 conn.request(
@@ -134,12 +149,72 @@ def ollama_embed(
                     headers={"Content-Type": "application/json"},
                 )
                 resp = conn.getresponse()
-                return json.loads(resp.read())
-            except (http.client.HTTPException, OSError):
+                body = resp.read()
+                if resp.status >= 500 or resp.status == 429:
+                    raise _RetryableHTTPError(resp.status, body)
+                return json.loads(body)
+            except (http.client.HTTPException, OSError, _RetryableHTTPError) as exc:
                 conn_holder[0] = None  # force reconnect
-                if attempt == 1:
-                    raise
-        raise OSError("unreachable")
+                last_exc = exc
+                if attempt < max_retries:
+                    delay = min(retry_base_delay * (2 ** attempt), retry_max_delay)
+                    delay *= random.uniform(0.5, 1.5)  # jitter
+                    time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    async def _async_post(payload: bytes) -> dict:
+        """POST to /api/embed via native asyncio.open_connection."""
+        import random
+
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+                try:
+                    request = (
+                        f"POST /api/embed HTTP/1.1\r\n"
+                        f"Host: {host}:{port}\r\n"
+                        f"Content-Type: application/json\r\n"
+                        f"Content-Length: {len(payload)}\r\n"
+                        f"Connection: close\r\n"
+                        f"\r\n"
+                    ).encode() + payload
+                    writer.write(request)
+                    await writer.drain()
+
+                    # Parse response status line
+                    status_line = await asyncio.wait_for(
+                        reader.readline(), timeout=30
+                    )
+                    status = int(status_line.split(b" ")[1])
+
+                    # Parse headers
+                    content_length = 0
+                    while True:
+                        line = await reader.readline()
+                        if line == b"\r\n":
+                            break
+                        if line.lower().startswith(b"content-length:"):
+                            content_length = int(line.split(b":")[1].strip())
+
+                    # Read body
+                    body = await asyncio.wait_for(
+                        reader.readexactly(content_length), timeout=30
+                    )
+
+                    if status >= 500 or status == 429:
+                        raise _RetryableHTTPError(status, body)
+                    return json.loads(body)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+            except (OSError, asyncio.TimeoutError, _RetryableHTTPError) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    delay = min(retry_base_delay * (2 ** attempt), retry_max_delay)
+                    delay *= random.uniform(0.5, 1.5)
+                    await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     def _cache_put(text: str, value: bytes) -> None:
         cache[text] = value
@@ -194,7 +269,10 @@ def ollama_embed(
             _cache_put(text, result)
             _l2_put(text, result)
             return result
-        except (http.client.HTTPException, OSError, KeyError, IndexError):
+        except (
+            http.client.HTTPException, OSError, _RetryableHTTPError,
+            KeyError, IndexError,
+        ):
             result = _fallback_with_warning(text)
             _cache_put(text, result)
             return result
@@ -230,13 +308,91 @@ def ollama_embed(
                     _cache_put(text, result)
                     _l2_put(text, result)
                     results[idx] = result
-            except (http.client.HTTPException, OSError, KeyError, IndexError):
+            except (
+                http.client.HTTPException, OSError, _RetryableHTTPError,
+                KeyError, IndexError,
+            ):
                 for idx, text in to_fetch:
                     result = _fallback_with_warning(text)
                     _cache_put(text, result)
                     results[idx] = result
 
         return results  # type: ignore[return-value]
+
+    # ── Async-native methods ──────────────────────────────────────────
+
+    async def _async_embed(text: str) -> bytes:
+        """Async-native single embed. Cache checks are sync (fast), HTTP is async."""
+        # L1 cache hit
+        if text in cache:
+            cache.move_to_end(text)
+            return cache[text]
+        # L2 cache hit
+        l2 = _l2_get(text)
+        if l2 is not None:
+            _cache_put(text, l2)
+            return l2
+        # Cache miss — async HTTP
+        try:
+            payload = json.dumps({"model": model, "input": text}).encode()
+            data = await _async_post(payload)
+            embedding = data["embeddings"][0]
+            vec = np.array(embedding, dtype=np.float32)
+            result = _maybe_quantize(vec.tobytes())
+            _cache_put(text, result)
+            _l2_put(text, result)
+            return result
+        except (
+            OSError, asyncio.TimeoutError, _RetryableHTTPError,
+            KeyError, IndexError,
+        ):
+            result = _fallback_with_warning(text)
+            _cache_put(text, result)
+            return result
+
+    async def _async_batch(texts: list[str]) -> list[bytes]:
+        """Async-native batch embed. Cache checks sync, HTTP async."""
+        results: list[bytes | None] = [None] * len(texts)
+        to_fetch: list[tuple[int, str]] = []
+
+        for i, text in enumerate(texts):
+            # L1
+            if text in cache:
+                cache.move_to_end(text)
+                results[i] = cache[text]
+                continue
+            # L2
+            l2 = _l2_get(text)
+            if l2 is not None:
+                _cache_put(text, l2)
+                results[i] = l2
+                continue
+            to_fetch.append((i, text))
+
+        if to_fetch:
+            fetch_texts = [t for _, t in to_fetch]
+            try:
+                payload = json.dumps({"model": model, "input": fetch_texts}).encode()
+                data = await _async_post(payload)
+                embeddings = data["embeddings"]
+                for j, (idx, text) in enumerate(to_fetch):
+                    vec = np.array(embeddings[j], dtype=np.float32)
+                    result = _maybe_quantize(vec.tobytes())
+                    _cache_put(text, result)
+                    _l2_put(text, result)
+                    results[idx] = result
+            except (
+                OSError, asyncio.TimeoutError, _RetryableHTTPError,
+                KeyError, IndexError,
+            ):
+                for idx, text in to_fetch:
+                    result = _fallback_with_warning(text)
+                    _cache_put(text, result)
+                    results[idx] = result
+
+        return results  # type: ignore[return-value]
+
+    # ── Sync generators ───────────────────────────────────────────────
 
     def _stream_batch(texts: list[str], chunk_size: int = 8):
         """Yield list[bytes] as each mini-batch completes (sync generator)."""
@@ -246,14 +402,17 @@ def ollama_embed(
 
     async def _astream_batch(texts: list[str], chunk_size: int = 8,
                              concurrency: int = 2):
-        """Yield list[bytes] per chunk, with N chunks in-flight (async generator)."""
+        """Yield list[bytes] per chunk, with N chunks in-flight (async generator).
+
+        v0.5.0: uses native async HTTP instead of thread pool.
+        """
         chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
         sem = asyncio.Semaphore(concurrency)
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _process(idx: int, chunk: list[str]) -> None:
             async with sem:
-                result = await asyncio.to_thread(_batch, chunk)
+                result = await _async_batch(chunk)
                 await queue.put((idx, result))
 
         tasks = [asyncio.create_task(_process(i, c)) for i, c in enumerate(chunks)]
@@ -270,16 +429,22 @@ def ollama_embed(
         # Ensure all tasks are done
         await asyncio.gather(*tasks)
 
+    # ── Attach methods to _embed ──────────────────────────────────────
+
     _embed.batch = _batch  # type: ignore[attr-defined]
     _embed.stream_batch = _stream_batch  # type: ignore[attr-defined]
     _embed.astream_batch = _astream_batch  # type: ignore[attr-defined]
+    _embed.async_call = _async_embed  # type: ignore[attr-defined]
+    _embed.async_batch = _async_batch  # type: ignore[attr-defined]
     return _embed
 
 
 def ollama_embed_async(
     **kwargs,
 ) -> Callable:
-    """Async wrapper around ollama_embed. Returns an async embed function.
+    """Native async variant of ollama_embed. Returns an async embed function.
+
+    v0.5.0: uses asyncio.open_connection for true async HTTP (no thread pool).
 
     Usage:
         embed = ollama_embed_async(model="nomic-embed-text")
@@ -289,10 +454,10 @@ def ollama_embed_async(
     sync_embed = ollama_embed(**kwargs)
 
     async def _embed(text: str) -> bytes:
-        return await asyncio.to_thread(sync_embed, text)
+        return await sync_embed.async_call(text)
 
     async def _batch(texts: list[str]) -> list[bytes]:
-        return await asyncio.to_thread(sync_embed.batch, texts)
+        return await sync_embed.async_batch(texts)
 
     _embed.batch = _batch  # type: ignore[attr-defined]
     _embed.stream_batch = sync_embed.stream_batch  # type: ignore[attr-defined]

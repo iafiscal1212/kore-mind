@@ -1,4 +1,4 @@
-"""Tests for built-in embedding providers (v0.4.0)."""
+"""Tests for built-in embedding providers (v0.5.0)."""
 
 import asyncio
 import json
@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from kore_mind.embeddings import (
+    _RetryableHTTPError,
     cosine_similarity,
     numpy_embed,
     ollama_embed,
@@ -74,7 +75,7 @@ def test_ollama_embed_fallback():
     """If Ollama is not running, ollama_embed falls back to numpy_embed."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        embed = ollama_embed(base_url="http://localhost:19")
+        embed = ollama_embed(base_url="http://localhost:19", max_retries=0)
         result = embed("fallback test")
     assert isinstance(result, bytes)
     assert len(result) > 0
@@ -247,7 +248,7 @@ def test_ollama_batch_uses_cache():
 
 def test_ollama_fallback_warns():
     """Fallback emits RuntimeWarning about dimension mismatch."""
-    embed = ollama_embed(base_url="http://localhost:19")
+    embed = ollama_embed(base_url="http://localhost:19", max_retries=0)
     with pytest.warns(RuntimeWarning, match="numpy vectors.*incompatible"):
         embed("trigger warning")
 
@@ -440,29 +441,38 @@ def test_quantize_cosine_accuracy():
     )
 
 
-# ── v0.4.0: Mejora 5 — Async variant ────────────────────────────────────
+# ── v0.4.0: Mejora 5 — Async variant (updated for v0.5.0 native async) ──
+
+
+def _make_async_response(body_bytes, status=200):
+    """Build a mock asyncio.open_connection that returns a fake HTTP response."""
+    http_response = (
+        f"HTTP/1.1 {status} OK\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        f"\r\n"
+    ).encode() + body_bytes
+
+    async def mock_open_connection(host, port):
+        reader = asyncio.StreamReader()
+        reader.feed_data(http_response)
+        reader.feed_eof()
+        writer = mock.AsyncMock()
+        writer.close = mock.Mock()
+        writer.wait_closed = mock.AsyncMock()
+        return reader, writer
+
+    return mock_open_connection
 
 
 def test_async_embed():
-    """await embed('text') devuelve bytes."""
-    import http.client
-
-    def mock_request(self, method, url, body=None, headers={}):
-        req_body = json.loads(body)
-        self._fake_body = _fake_ollama_response(req_body["input"])
-
-    def mock_getresponse(self):
-        resp = mock.Mock()
-        resp.read.return_value = self._fake_body
-        resp.status = 200
-        return resp
-
+    """await embed('text') devuelve bytes (native async)."""
+    response = _fake_ollama_response("async test")
+    mock_conn = _make_async_response(response)
     embed = ollama_embed_async()
 
     async def _run():
-        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
-            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
-                return await embed("async test")
+        with mock.patch("asyncio.open_connection", mock_conn):
+            return await embed("async test")
 
     result = asyncio.run(_run())
     assert isinstance(result, bytes)
@@ -470,25 +480,15 @@ def test_async_embed():
 
 
 def test_async_batch():
-    """await embed.batch(texts) devuelve lista correcta."""
-    import http.client
-
-    def mock_request(self, method, url, body=None, headers={}):
-        req_body = json.loads(body)
-        self._fake_body = _fake_ollama_response(req_body["input"])
-
-    def mock_getresponse(self):
-        resp = mock.Mock()
-        resp.read.return_value = self._fake_body
-        resp.status = 200
-        return resp
-
+    """await embed.batch(texts) devuelve lista correcta (native async)."""
+    texts = ["alpha", "beta", "gamma"]
+    response = _fake_ollama_response(texts)
+    mock_conn = _make_async_response(response)
     embed = ollama_embed_async()
 
     async def _run():
-        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
-            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
-                return await embed.batch(["alpha", "beta", "gamma"])
+        with mock.patch("asyncio.open_connection", mock_conn):
+            return await embed.batch(texts)
 
     results = asyncio.run(_run())
     assert isinstance(results, list)
@@ -562,28 +562,34 @@ def test_stream_batch_correct_order():
 
 
 def test_astream_batch_concurrent():
-    """Async generator produce chunks ordenados."""
-    import http.client
+    """Async generator produce chunks ordenados (native async)."""
     embed = ollama_embed()
     texts = [f"async_{i}" for i in range(16)]
 
-    def mock_request(self, method, url, body=None, headers={}):
-        req_body = json.loads(body)
-        self._fake_body = _fake_ollama_response(req_body["input"])
+    call_count = [0]
 
-    def mock_getresponse(self):
-        resp = mock.Mock()
-        resp.read.return_value = self._fake_body
-        resp.status = 200
-        return resp
+    async def mock_open_connection(host, port):
+        call_count[0] += 1
+        reader = asyncio.StreamReader()
+        body = _fake_ollama_response([f"async_{i}" for i in range(4)])
+        http_resp = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+        ).encode() + body
+        reader.feed_data(http_resp)
+        reader.feed_eof()
+        writer = mock.AsyncMock()
+        writer.close = mock.Mock()
+        writer.wait_closed = mock.AsyncMock()
+        return reader, writer
 
     async def _run():
-        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
-            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
-                results = []
-                async for chunk in embed.astream_batch(texts, chunk_size=4, concurrency=2):
-                    results.append(chunk)
-                return results
+        with mock.patch("asyncio.open_connection", mock_open_connection):
+            results = []
+            async for chunk in embed.astream_batch(texts, chunk_size=4, concurrency=2):
+                results.append(chunk)
+            return results
 
     chunks = asyncio.run(_run())
     assert len(chunks) == 4  # 16/4 = 4 chunks
@@ -626,3 +632,319 @@ def test_stream_batch_uses_cache():
     assert len(chunks[0]) == 4
     # Only 2 uncached texts should trigger HTTP (1 call because they're in the same chunk)
     assert call_count[0] == 1, f"Expected 1 HTTP call for uncached, got {call_count[0]}"
+
+
+# ── v0.5.0: Retry con exponential backoff ────────────────────────────────
+
+
+def test_retry_backoff_on_connection_error():
+    """3 connection errors + 1 success = result OK, delays crecientes."""
+    import http.client
+
+    call_count = [0]
+    success_response = _fake_ollama_response("retry test")
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        if call_count[0] <= 3:
+            raise OSError("Connection refused")
+        self._fake_body = success_response
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = 200
+        return resp
+
+    embed = ollama_embed(max_retries=3, retry_base_delay=0.01, retry_max_delay=0.1)
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            result = embed("retry test")
+
+    assert isinstance(result, bytes)
+    assert len(result) == 768 * 4
+    assert call_count[0] == 4, f"Expected 4 attempts (3 fail + 1 success), got {call_count[0]}"
+
+
+def test_retry_backoff_on_5xx():
+    """HTTP 503 x2, then 200 = OK."""
+    import http.client
+
+    call_count = [0]
+    success_response = _fake_ollama_response("5xx test")
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        if call_count[0] <= 2:
+            self._fake_body = b'{"error": "service unavailable"}'
+            self._fake_status = 503
+        else:
+            self._fake_body = success_response
+            self._fake_status = 200
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = self._fake_status
+        return resp
+
+    embed = ollama_embed(max_retries=3, retry_base_delay=0.01, retry_max_delay=0.1)
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            result = embed("5xx test")
+
+    assert isinstance(result, bytes)
+    assert len(result) == 768 * 4
+    assert call_count[0] == 3, f"Expected 3 attempts (2 x 503 + 1 x 200), got {call_count[0]}"
+
+
+def test_retry_backoff_on_429():
+    """HTTP 429 x1, then 200 = OK."""
+    import http.client
+
+    call_count = [0]
+    success_response = _fake_ollama_response("429 test")
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            self._fake_body = b'{"error": "rate limited"}'
+            self._fake_status = 429
+        else:
+            self._fake_body = success_response
+            self._fake_status = 200
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = self._fake_status
+        return resp
+
+    embed = ollama_embed(max_retries=3, retry_base_delay=0.01, retry_max_delay=0.1)
+
+    with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+            result = embed("429 test")
+
+    assert isinstance(result, bytes)
+    assert len(result) == 768 * 4
+    assert call_count[0] == 2, f"Expected 2 attempts (1 x 429 + 1 x 200), got {call_count[0]}"
+
+
+def test_retry_exhausted_raises():
+    """max_retries+1 failures = exception propagated (falls back to numpy)."""
+    import http.client
+
+    call_count = [0]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        raise OSError("Connection refused")
+
+    embed = ollama_embed(max_retries=2, retry_base_delay=0.01, retry_max_delay=0.1)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            result = embed("exhausted test")
+
+    # Falls back to numpy_embed after retries exhausted
+    np_embed = numpy_embed()
+    expected = np_embed("exhausted test")
+    assert result == expected
+    assert call_count[0] == 3, f"Expected 3 attempts (0..max_retries=2), got {call_count[0]}"
+
+
+def test_no_retry_on_4xx():
+    """HTTP 400 = no retry, immediate fallback."""
+    import http.client
+
+    call_count = [0]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        self._fake_body = b'{"error": "bad request"}'
+        self._fake_status = 400
+
+    def mock_getresponse(self):
+        resp = mock.Mock()
+        resp.read.return_value = self._fake_body
+        resp.status = self._fake_status
+        return resp
+
+    embed = ollama_embed(max_retries=3, retry_base_delay=0.01, retry_max_delay=0.1)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            with mock.patch.object(http.client.HTTPConnection, "getresponse", mock_getresponse):
+                result = embed("4xx test")
+
+    # Falls back to numpy (response has no "embeddings" key -> KeyError -> fallback)
+    np_embed = numpy_embed()
+    expected = np_embed("4xx test")
+    assert result == expected
+    # Only 1 call — no retries for 4xx
+    assert call_count[0] == 1, f"Expected 1 attempt (no retry on 4xx), got {call_count[0]}"
+
+
+def test_retry_params_configurable():
+    """max_retries=0 means no retries at all."""
+    import http.client
+
+    call_count = [0]
+
+    def mock_request(self, method, url, body=None, headers={}):
+        call_count[0] += 1
+        raise OSError("Connection refused")
+
+    embed = ollama_embed(max_retries=0, retry_base_delay=0.01)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with mock.patch.object(http.client.HTTPConnection, "request", mock_request):
+            result = embed("no retry test")
+
+    # Falls back to numpy
+    np_embed = numpy_embed()
+    expected = np_embed("no retry test")
+    assert result == expected
+    assert call_count[0] == 1, f"Expected exactly 1 attempt with max_retries=0, got {call_count[0]}"
+
+
+# ── v0.5.0: Native async ─────────────────────────────────────────────────
+
+
+def test_async_native_embed():
+    """await embed('text') uses asyncio.open_connection (not to_thread)."""
+    response = _fake_ollama_response("native async")
+    open_conn_called = [False]
+
+    async def mock_open_connection(host, port):
+        open_conn_called[0] = True
+        reader = asyncio.StreamReader()
+        http_resp = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Length: {len(response)}\r\n"
+            f"\r\n"
+        ).encode() + response
+        reader.feed_data(http_resp)
+        reader.feed_eof()
+        writer = mock.AsyncMock()
+        writer.close = mock.Mock()
+        writer.wait_closed = mock.AsyncMock()
+        return reader, writer
+
+    embed = ollama_embed_async()
+
+    async def _run():
+        with mock.patch("asyncio.open_connection", mock_open_connection):
+            return await embed("native async")
+
+    result = asyncio.run(_run())
+    assert isinstance(result, bytes)
+    assert len(result) == 768 * 4
+    assert open_conn_called[0], "Should use asyncio.open_connection, not to_thread"
+
+
+def test_async_native_batch():
+    """await embed.batch(texts) uses native async HTTP."""
+    texts = ["batch_a", "batch_b", "batch_c"]
+    response = _fake_ollama_response(texts)
+    open_conn_called = [False]
+
+    async def mock_open_connection(host, port):
+        open_conn_called[0] = True
+        reader = asyncio.StreamReader()
+        http_resp = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Length: {len(response)}\r\n"
+            f"\r\n"
+        ).encode() + response
+        reader.feed_data(http_resp)
+        reader.feed_eof()
+        writer = mock.AsyncMock()
+        writer.close = mock.Mock()
+        writer.wait_closed = mock.AsyncMock()
+        return reader, writer
+
+    embed = ollama_embed_async()
+
+    async def _run():
+        with mock.patch("asyncio.open_connection", mock_open_connection):
+            return await embed.batch(texts)
+
+    results = asyncio.run(_run())
+    assert isinstance(results, list)
+    assert len(results) == 3
+    assert open_conn_called[0], "Should use asyncio.open_connection for batch"
+
+
+def test_astream_batch_native_async():
+    """astream_batch uses native async HTTP, not thread pool."""
+    embed = ollama_embed()
+    texts = [f"stream_{i}" for i in range(8)]
+    open_conn_calls = [0]
+
+    async def mock_open_connection(host, port):
+        open_conn_calls[0] += 1
+        body = _fake_ollama_response([f"stream_{i}" for i in range(4)])
+        reader = asyncio.StreamReader()
+        http_resp = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+        ).encode() + body
+        reader.feed_data(http_resp)
+        reader.feed_eof()
+        writer = mock.AsyncMock()
+        writer.close = mock.Mock()
+        writer.wait_closed = mock.AsyncMock()
+        return reader, writer
+
+    async def _run():
+        with mock.patch("asyncio.open_connection", mock_open_connection):
+            results = []
+            async for chunk in embed.astream_batch(texts, chunk_size=4, concurrency=2):
+                results.append(chunk)
+            return results
+
+    chunks = asyncio.run(_run())
+    assert len(chunks) == 2  # 8/4 = 2 chunks
+    assert open_conn_calls[0] == 2, "Should open 2 async connections (not use to_thread)"
+
+
+def test_async_retry_backoff():
+    """Async: 2 failures + success = OK with retries."""
+    call_count = [0]
+    success_response = _fake_ollama_response("async retry")
+
+    async def mock_open_connection(host, port):
+        call_count[0] += 1
+        if call_count[0] <= 2:
+            raise OSError("Connection refused")
+        reader = asyncio.StreamReader()
+        http_resp = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Length: {len(success_response)}\r\n"
+            f"\r\n"
+        ).encode() + success_response
+        reader.feed_data(http_resp)
+        reader.feed_eof()
+        writer = mock.AsyncMock()
+        writer.close = mock.Mock()
+        writer.wait_closed = mock.AsyncMock()
+        return reader, writer
+
+    embed = ollama_embed_async(max_retries=3, retry_base_delay=0.01, retry_max_delay=0.1)
+
+    async def _run():
+        with mock.patch("asyncio.open_connection", mock_open_connection):
+            return await embed("async retry")
+
+    result = asyncio.run(_run())
+    assert isinstance(result, bytes)
+    assert len(result) == 768 * 4
+    assert call_count[0] == 3, f"Expected 3 attempts (2 fail + 1 success), got {call_count[0]}"
