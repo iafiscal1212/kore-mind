@@ -1,4 +1,4 @@
-"""Mind: the core class. 5 methods. That's it."""
+"""Mind: the core class. Persistent memory with per-user filtering and observability."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Callable
 
 from kore_mind.consolidate import consolidate
 from kore_mind.decay import DEFAULT_HALF_LIFE, apply_decay
-from kore_mind.models import Identity, Memory, MemoryType
+from kore_mind.models import Identity, Memory, MemoryType, Trace
 from kore_mind.storage import Storage
 
 # Type: takes text, returns embedding as bytes (numpy float32 .tobytes())
@@ -24,14 +24,33 @@ class Mind:
         mind.reflect(fn)        — consolidar, decaer, evolucionar
         mind.identity()         — quién soy ahora
         mind.forget(threshold)  — poda explícita
+        mind.scoped(source)     — vista filtrada por source, misma DB
+        mind.traces()           — consultar trazas de operaciones
     """
 
     def __init__(self, path: str | Path = "mind.db",
                  half_life: float = DEFAULT_HALF_LIFE,
-                 embed_fn: EmbedFn | None = None) -> None:
-        self._storage = Storage(path)
+                 embed_fn: EmbedFn | None = None,
+                 default_source: str = "",
+                 enable_traces: bool = False,
+                 _storage: Storage | None = None) -> None:
+        self._storage = _storage or Storage(path)
         self._half_life = half_life
         self._embed_fn = embed_fn
+        self._default_source = default_source
+        self._enable_traces = enable_traces
+
+    # ── scoped ─────────────────────────────────────────────────────────
+
+    def scoped(self, source: str) -> Mind:
+        """Devuelve una vista filtrada por source. Misma DB, distinto filtro."""
+        return Mind(
+            _storage=self._storage,
+            half_life=self._half_life,
+            embed_fn=self._embed_fn,
+            default_source=source,
+            enable_traces=self._enable_traces,
+        )
 
     # ── experience ─────────────────────────────────────────────────────
 
@@ -41,8 +60,11 @@ class Mind:
                    tags: list[str] | None = None,
                    salience: float = 1.0) -> Memory:
         """Registra una experiencia. Algo pasó."""
+        t0 = time.time()
         if isinstance(type, str):
             type = MemoryType(type)
+
+        effective_source = source or self._default_source
 
         embedding = None
         if self._embed_fn is not None:
@@ -51,27 +73,40 @@ class Mind:
         mem = Memory(
             content=content,
             type=type,
-            source=source,
+            source=effective_source,
             tags=tags or [],
             salience=salience,
             embedding=embedding,
         )
         self._storage.save_memory(mem)
+
+        self._trace("experience", content, mem.id,
+                    effective_source, t0)
         return mem
 
     # ── recall ─────────────────────────────────────────────────────────
 
     def recall(self, query: str = "", limit: int = 20,
-              min_salience: float = 0.05) -> list[Memory]:
+              min_salience: float = 0.05,
+              source: str | None = None) -> list[Memory]:
         """Recupera recuerdos relevantes.
 
         Sin query: devuelve los más salientes.
         Con query + embed_fn: búsqueda semántica por cosine similarity.
         Con query sin embed_fn: búsqueda por substring match.
+        source: filtra por source. None = usa default_source si existe.
         """
+        t0 = time.time()
+
+        # Determine effective source filter
+        effective_source = source if source is not None else (
+            self._default_source or None
+        )
+
         memories = self._storage.top_memories(
             limit=limit * 3,
             min_salience=min_salience,
+            source=effective_source,
         )
 
         if query and self._embed_fn is not None:
@@ -114,18 +149,15 @@ class Mind:
                 self._storage.save_memory(mem)
             final.append(mem)
 
+        self._trace("recall", query, f"{len(final)} memories",
+                    effective_source or "", t0)
         return final
 
     # ── reflect ────────────────────────────────────────────────────────
 
     def reflect(self, summarizer: Callable[[list[Memory]], Identity] | None = None) -> Identity:
-        """Consolida la mente: decay + consolidación + poda + identidad emergente.
-
-        Args:
-            summarizer: función opcional que recibe recuerdos y genera Identity.
-                        Aquí es donde kore-bridge conecta un LLM.
-                        Sin summarizer, genera identidad básica por estadísticas.
-        """
+        """Consolida la mente: decay + consolidación + poda + identidad emergente."""
+        t0 = time.time()
         all_mems = self._storage.all_memories()
 
         # 1. Decay
@@ -155,6 +187,10 @@ class Mind:
 
         identity.updated_at = time.time()
         self._storage.save_identity(identity)
+
+        self._trace("reflect", f"{len(all_mems)} memories",
+                    f"{len(alive)} alive, {len(dead)} dead",
+                    self._default_source, t0)
         return identity
 
     # ── identity ───────────────────────────────────────────────────────
@@ -167,7 +203,36 @@ class Mind:
 
     def forget(self, threshold: float = 0.1) -> int:
         """Olvida recuerdos con salience bajo el umbral. Devuelve cuántos."""
-        return self._storage.delete_below_salience(threshold)
+        t0 = time.time()
+        count = self._storage.delete_below_salience(threshold)
+        self._trace("forget", f"threshold={threshold}",
+                    f"{count} deleted", self._default_source, t0)
+        return count
+
+    # ── traces (observability) ─────────────────────────────────────────
+
+    def _trace(self, operation: str, input_text: str,
+               output_text: str, source: str, t0: float) -> None:
+        """Registra un trace si enable_traces=True."""
+        if not self._enable_traces:
+            return
+        duration_ms = (time.time() - t0) * 1000
+        trace = Trace(
+            operation=operation,
+            input_text=str(input_text)[:500],
+            output_text=str(output_text)[:500],
+            source=source or "",
+            duration_ms=duration_ms,
+        )
+        self._storage.save_trace(trace)
+
+    def traces(self, operation: str | None = None,
+               source: str | None = None,
+               limit: int = 100) -> list[Trace]:
+        """Consulta trazas de operaciones."""
+        return self._storage.load_traces(
+            operation=operation, source=source, limit=limit,
+        )
 
     # ── utilidades ─────────────────────────────────────────────────────
 

@@ -45,3 +45,32 @@ class Identity:
     summary: str = ""
     relationships: dict[str, str] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class Trace:
+    """Registro de operación para observabilidad."""
+
+    operation: str
+    input_text: str = ""
+    output_text: str = ""
+    source: str = ""
+    duration_ms: float | None = None
+    metadata: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+
+@dataclass
+class CacheEntry:
+    """Entrada de caché cognitivo."""
+
+    query: str
+    response: str
+    query_hash: str = ""
+    source: str = ""
+    created_at: float = field(default_factory=time.time)
+    ttl: float = 3600.0
+    hit_count: int = 0
+    embedding: bytes | None = None
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
