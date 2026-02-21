@@ -4,10 +4,13 @@ Persistent memory + emergent identity engine for any LLM.
 
 **One file = one mind.** SQLite-based. Zero config. Zero external dependencies. Runtime-agnostic.
 
+Part of [**kore-stack**](https://github.com/iafiscal1212/kore-stack) — the complete cognitive middleware for LLMs. `pip install kore-stack` for the full stack, or install individually:
+
 ## Install
 
 ```bash
-pip install kore-mind
+pip install kore-mind          # just the memory engine
+pip install kore-stack         # full stack: mind + bridge + SC routing
 ```
 
 ## Usage
@@ -129,6 +132,15 @@ mind = Mind("agent.db")
 mind.experience("fact")
 mind.recall("query")
 ```
+
+## Part of kore-stack
+
+| Package | What it does |
+|---------|-------------|
+| **kore-mind** (this) | Memory, identity, traces, cache storage |
+| [kore-bridge](https://github.com/iafiscal1212/kore-bridge) | LLM integration, cache logic, rate limiting, A/B testing |
+| [sc-router](https://github.com/iafiscal1212/sc-router) | Query routing by Selector Complexity theory |
+| [**kore-stack**](https://github.com/iafiscal1212/kore-stack) | All of the above, one install: `pip install kore-stack` |
 
 ## License
 
