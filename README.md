@@ -53,6 +53,38 @@ mind.forget(threshold=0.1)
 | `scoped(source)` | Filtered view per user. Same DB. |
 | `traces()` | Query operation traces. |
 
+## Semantic Search (v0.3)
+
+Built-in embedding providers — semantic recall works with one line:
+
+```python
+from kore_mind import Mind, numpy_embed
+
+# Zero-dependency option (numpy only, no external service)
+mind = Mind("agent.db", embed_fn=numpy_embed())
+
+mind.experience("me gusta el café por la mañana")
+mind.experience("Python es un lenguaje de programación")
+
+# Finds "café" even searching for "bebidas calientes"
+results = mind.recall("bebidas calientes")
+```
+
+Three providers available:
+
+```python
+from kore_mind.embeddings import numpy_embed, ollama_embed, openai_embed
+
+# 1. numpy_embed — zero dependencies, deterministic, fast
+mind = Mind("agent.db", embed_fn=numpy_embed())
+
+# 2. ollama_embed — local Ollama server (falls back to numpy if unavailable)
+mind = Mind("agent.db", embed_fn=ollama_embed())
+
+# 3. openai_embed — cloud, max quality (requires API key)
+mind = Mind("agent.db", embed_fn=openai_embed(api_key="sk-..."))
+```
+
 ## v0.2 Features
 
 ### Per-user filtering

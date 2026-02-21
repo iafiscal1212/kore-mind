@@ -163,6 +163,38 @@ def main():
     mind.close()
     os.unlink(db_path)
 
+    # ── Semantic Search Demo (v0.3) ─────────────────────────────────────
+
+    header("SEMANTIC SEARCH (v0.3)")
+
+    try:
+        from kore_mind.embeddings import numpy_embed
+
+        fd2, db2 = tempfile.mkstemp(suffix=".db")
+        os.close(fd2)
+
+        embed = numpy_embed()
+        smind = Mind(db2, embed_fn=embed)
+
+        smind.experience("me gusta el café por la mañana", type="semantic")
+        smind.experience("el teorema de Pitágoras es fundamental", type="semantic")
+        smind.experience("Python es un lenguaje de programación", type="semantic")
+
+        query = "bebidas calientes"
+        results = smind.recall(query)
+
+        print(f'  Query: "{query}"\n')
+        for i, mem in enumerate(results, 1):
+            print(f"    {i}. {mem.content}")
+        print(f"\n  Substring match would find NOTHING.")
+        print(f"  Semantic search found {len(results)} relevant memories.\n")
+
+        smind.close()
+        os.unlink(db2)
+
+    except ImportError:
+        print("  (install numpy to enable: pip install kore-mind[embeddings])\n")
+
 
 if __name__ == "__main__":
     main()

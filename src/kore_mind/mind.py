@@ -120,7 +120,7 @@ class Mind:
                 combined = sim * 0.7 + mem.salience * 0.3
                 result.append((combined, mem))
             result.sort(key=lambda x: x[0], reverse=True)
-            result = [mem for _, mem in result[:limit]]
+            result = result[:limit]
         elif query:
             # Text search fallback — only reinforce actual matches
             query_lower = query.lower()
