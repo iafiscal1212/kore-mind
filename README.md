@@ -2,7 +2,7 @@
 
 Persistent memory + emergent identity engine for any LLM.
 
-**One file = one mind.** SQLite-based. Zero config. Runtime-agnostic.
+**One file = one mind.** SQLite-based. Zero config. Zero external dependencies. Runtime-agnostic.
 
 ## Install
 
@@ -38,7 +38,7 @@ mind.forget(threshold=0.1)
 - **Identity is emergent**: not configured, but computed from accumulated memories.
 - **reflect()** is the key operation: decay + consolidation + identity update.
 
-## API (5 methods)
+## API
 
 | Method | Description |
 |--------|-------------|
@@ -47,6 +47,88 @@ mind.forget(threshold=0.1)
 | `reflect(fn)` | Consolidate. Decay. Evolve. |
 | `identity()` | Who am I now? |
 | `forget(threshold)` | Explicit pruning. |
+| `scoped(source)` | Filtered view per user. Same DB. |
+| `traces()` | Query operation traces. |
+
+## v0.2 Features
+
+### Per-user filtering
+
+Each user gets their own "mind" — same database, different context.
+
+```python
+# Option 1: default source
+mind = Mind("agent.db", default_source="carlos")
+mind.experience("Likes Python")  # automatically tagged to carlos
+mind.recall("Python")            # only carlos's memories
+
+# Option 2: scoped view
+alice = mind.scoped("alice")
+alice.experience("Prefers Rust")
+alice.recall()  # only alice's memories
+```
+
+### Observability
+
+Full tracing of every operation. Zero overhead when disabled (default).
+
+```python
+mind = Mind("agent.db", enable_traces=True)
+
+mind.experience("Something happened")
+mind.recall("what happened")
+
+# Query traces
+traces = mind.traces(operation="recall")
+for t in traces:
+    print(f"{t.operation} took {t.duration_ms:.1f}ms")
+
+# Filter by source
+traces = mind.traces(source="carlos", limit=50)
+```
+
+### Smart Cache (storage layer)
+
+Hash-based cache with TTL, per-user isolation, and hit counting. Used by [kore-bridge](https://github.com/iafiscal1212/kore-bridge) for token savings.
+
+```python
+from kore_mind.models import CacheEntry
+
+entry = CacheEntry(
+    query="What is P vs NP?",
+    response="It's an open problem...",
+    query_hash="a1b2c3d4",
+    source="carlos",
+    ttl=3600.0,
+)
+mind._storage.save_cache_entry(entry)
+found = mind._storage.find_cache_by_hash("a1b2c3d4", source="carlos")
+```
+
+### Rate Limiting (storage layer)
+
+Query logging with temporal window counting. Used by [kore-bridge](https://github.com/iafiscal1212/kore-bridge) for cognitive rate limiting.
+
+## Models
+
+| Model | Description |
+|-------|-------------|
+| `Memory` | A memory with lifecycle (salience, decay, tags, embedding) |
+| `Identity` | Emergent identity (traits, summary, relationships) |
+| `MemoryType` | episodic, semantic, procedural |
+| `Trace` | Operation trace (operation, duration, source, metadata) |
+| `CacheEntry` | Cache entry (query, response, hash, TTL, hit count) |
+
+## Backward compatibility
+
+All new parameters have defaults that preserve v0.1 behavior:
+
+```python
+# This works exactly the same as v0.1
+mind = Mind("agent.db")
+mind.experience("fact")
+mind.recall("query")
+```
 
 ## License
 
