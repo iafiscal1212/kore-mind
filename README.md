@@ -85,21 +85,46 @@ mind = Mind("agent.db", embed_fn=ollama_embed())
 mind = Mind("agent.db", embed_fn=openai_embed(api_key="sk-..."))
 ```
 
-### Ollama optimizations (v0.3.1)
+### Embedding improvements (v0.4.0)
 
-`ollama_embed()` now includes connection reuse, LRU cache, batch embedding, and fallback warnings:
+`ollama_embed()` now includes persistent cache, float16 quantization, async support, and streaming batch:
 
 ```python
-embed = ollama_embed(model="nomic-embed-text", cache_size=512)
+from kore_mind import ollama_embed, ollama_embed_async
+from kore_mind.storage import Storage
 
-# Single embeddings — cached automatically (same text = 0 HTTP calls)
+# Persistent L2 cache (survives restarts)
+store = Storage("embeddings.db")
+embed = ollama_embed(model="nomic-embed-text", storage=store)
+
+# Single embeddings — L1 (memory) + L2 (SQLite) cache
 vec = embed("some text")
 
 # Batch embedding — one HTTP call for all uncached texts
 vectors = embed.batch(["text one", "text two", "text three"])
 
-# Fallback to numpy emits RuntimeWarning (dimension mismatch: 256d vs 768d)
+# Float16 quantization (half the memory: 768*2=1.5KB vs 768*4=3KB)
+embed_q = ollama_embed(quantize=True)
+
+# Streaming batch — yield results as each mini-batch completes
+for chunk in embed.stream_batch(texts, chunk_size=8):
+    process(chunk)  # don't wait for all 200 texts
+
+# Async variant
+embed_async = ollama_embed_async(model="nomic-embed-text")
+result = await embed_async("hello world")
+results = await embed_async.batch(["a", "b", "c"])
+
+# Async streaming with concurrency control
+async for chunk in embed.astream_batch(texts, chunk_size=8, concurrency=2):
+    await process(chunk)
 ```
+
+`cosine_similarity()` now validates dimensions (raises `ValueError` on mismatch) and auto-detects float32/float16 encoding.
+
+### Ollama optimizations (v0.3.1)
+
+Connection reuse, LRU cache, batch embedding, and fallback warnings.
 
 ## v0.2 Features
 
